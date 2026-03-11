@@ -1,0 +1,15 @@
+# VideoSlideShow playlist
+# One file path per line (absolute or relative to the executable directory).
+# Supported image formats: JPEG, PNG, BMP, GIF, TIFF, and any WIC-decodable format.
+# Supported video formats: MP4, WMV, AVI, MOV, MKV, M4V, MPEG, and any
+#   format supported by Windows Media Foundation on the host machine.
+#
+# Example:
+#   images\photo1.jpg
+#   images\photo2.png
+#   videos\clip1.mp4
+#   videos\clip2.wmv
+
+images\photo1.jpg
+images\photo2.png
+videos\clip1.mp4
