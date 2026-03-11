@@ -370,7 +370,7 @@ bool Application::Initialize(HWND hwnd, int w, int h)
         {
             while (!line.empty() && std::iswspace(line.back()))  line.pop_back();
             while (!line.empty() && std::iswspace(line.front())) line.erase(line.begin());
-            if (!line.empty())
+            if (!line.empty() && line.front() != L'#')
             {
                 MediaItem item{ line, DetectType(line) };
                 m_playlist.push_back(std::move(item));
