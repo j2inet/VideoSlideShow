@@ -1,0 +1,21 @@
+# VideoSlideShow – build artifacts and local VS files
+
+# Visual Studio build output
+bin/
+obj/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+.vs/
+
+# Object / PDB files produced by the compiler
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.idb
+
+# Executable
+*.exe
