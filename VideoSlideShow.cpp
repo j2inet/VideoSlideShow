@@ -160,6 +160,9 @@ struct VideoState
     std::atomic<bool>    paused       { false };
     std::atomic<bool>    stopRequested{ false };
 
+    // Metrics: running count of frames decoded (incremented in ThreadProc).
+    std::atomic<uint32_t> decodeFrameCount{ 0 };
+
     std::thread thread;
 
     void Start();
@@ -280,6 +283,8 @@ void VideoState::ThreadProc()
             frameH = videoH;
             framePixels.assign(pData, pData + cbData);
             newFrame = true;
+            // Count every successfully decoded frame for VideoDecodeFPS metric.
+            decodeFrameCount.fetch_add(1, std::memory_order_relaxed);
             buf->Unlock();
         }
 
@@ -372,6 +377,14 @@ private:
     using Clock = std::chrono::steady_clock;
     Clock::time_point m_transStart;
 
+    // --- FPS metrics ---------------------------------------------------------
+    // Screen render FPS: count presents per second in Render().
+    uint32_t          m_renderFrameCount = 0;
+    Clock::time_point m_renderFpsTime;           // set in Initialize()
+    // Video decode FPS: snapshot of aggregate decodeFrameCount across all planes.
+    uint32_t          m_lastDecodeCount = 0;
+    Clock::time_point m_decodeFpsTime;           // set in Initialize()
+
     int m_width  = 0;
     int m_height = 0;
 
@@ -452,6 +465,10 @@ bool Application::Initialize(HWND hwnd, int w, int h)
     UpdateCB(1);
     UpdateUVCB(0);
     UpdateUVCB(1);
+
+    // Seed FPS metric clocks so the first measurement window starts now.
+    m_renderFpsTime  = Clock::now();
+    m_decodeFpsTime  = Clock::now();
     return true;
 }
 
@@ -834,6 +851,31 @@ void Application::Update()
     // --- Update UV rotation transforms ---------------------------------------
     UpdateUVCB(0);
     UpdateUVCB(1);
+
+    // --- Compute aggregate video decode FPS (1-second rolling window) --------
+    // Sum decodeFrameCount across all active video planes (aggregate metric).
+    uint32_t totalDecoded = 0;
+    for (int i = 0; i < 2; ++i)
+        if (m_plane[i].video)
+            totalDecoded += m_plane[i].video->decodeFrameCount.load(std::memory_order_relaxed);
+
+    {
+        auto now     = Clock::now();
+        float elapsed = std::chrono::duration<float>(now - m_decodeFpsTime).count();
+        if (elapsed >= 1.0f)
+        {
+            uint32_t delta = totalDecoded - m_lastDecodeCount;
+            renderMetrics.VideoDecodeFPS = static_cast<float>(delta) / elapsed;
+            m_lastDecodeCount = totalDecoded;
+            m_decodeFpsTime   = now;
+
+#ifdef _DEBUG
+            wchar_t dbg[128];
+            swprintf_s(dbg, L"[Metrics] VideoDecodeFPS=%.1f\n", renderMetrics.VideoDecodeFPS);
+            OutputDebugStringW(dbg);
+#endif
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -881,6 +923,25 @@ void Application::Render()
     }
 
     m_sc->Present(1, 0);
+
+    // --- Compute screen render FPS (1-second rolling window) -----------------
+    ++m_renderFrameCount;
+    {
+        auto now     = Clock::now();
+        float elapsed = std::chrono::duration<float>(now - m_renderFpsTime).count();
+        if (elapsed >= 1.0f)
+        {
+            renderMetrics.ScreenRenderFPS = static_cast<float>(m_renderFrameCount) / elapsed;
+            m_renderFrameCount = 0;
+            m_renderFpsTime    = now;
+
+#ifdef _DEBUG
+            wchar_t dbg[128];
+            swprintf_s(dbg, L"[Metrics] ScreenRenderFPS=%.1f\n", renderMetrics.ScreenRenderFPS);
+            OutputDebugStringW(dbg);
+#endif
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
