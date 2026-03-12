@@ -111,6 +111,13 @@ static const Vertex QUAD_VERTS[] =
 };
 static const UINT QUAD_IDX[] = { 0, 1, 2, 1, 3, 2 };
 
+typedef struct _MEDIA_METRICS {
+    FLOAT VideoDecodeFPS;
+    FLOAT ScreenRenderFPS;
+} MEDIA_METRICS;
+
+static MEDIA_METRICS renderMetrics = {};
+
 // ---------------------------------------------------------------------------
 //  Media type detection
 // ---------------------------------------------------------------------------
