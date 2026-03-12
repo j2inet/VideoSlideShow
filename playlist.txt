@@ -9,7 +9,11 @@
 #   images\photo2.png
 #   videos\clip1.mp4
 #   videos\clip2.wmv
-
-images\photo1.jpg
-images\photo2.png
-videos\clip1.mp4
+images/Slide1-Map.mp4
+images/Slide2-3.mp4
+images/Slide4.mp4
+images/Slide5.mp4
+images/Slide6Route.mp4
+images/slide7.mp4
+images/slide8Route.mp4
+images/Slide9_Image.png

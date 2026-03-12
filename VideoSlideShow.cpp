@@ -22,6 +22,7 @@
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
+#include <mfobjects.h>
 #include <wrl/client.h>
 #include <DirectXMath.h>
 
@@ -50,13 +51,17 @@
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
 
+#ifndef MFVideoFormat_BGRA32
+const GUID MFVideoFormat_BGRA32 = { 0x00000016, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+#endif
+
 // ---------------------------------------------------------------------------
 //  Constants
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_TITLE          = L"VideoSlideShow";
 static const wchar_t* PLAYLIST_FILE      = L"playlist.txt";
-static const int      WINDOW_WIDTH       = 1280;
-static const int      WINDOW_HEIGHT      = 720;
+static const int      WINDOW_WIDTH       = 2160;
+static const int      WINDOW_HEIGHT      = 3840;
 static const float    TRANSITION_SECONDS = 0.6f;
 
 // ---------------------------------------------------------------------------
@@ -184,7 +189,7 @@ void VideoState::ThreadProc()
     ComPtr<IMFMediaType> outType;
     MFCreateMediaType(&outType);
     outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    outType->SetGUID(MF_MT_SUBTYPE,    MFVideoFormat_BGRA32);
+    outType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_BGRA32);
     hr = reader->SetCurrentMediaType(
             MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, outType.Get());
     if (FAILED(hr)) { CoUninitialize(); return; }
