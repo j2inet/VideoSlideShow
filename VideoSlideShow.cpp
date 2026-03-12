@@ -28,11 +28,13 @@
 
 #include <string>
 #include <vector>
+#include <deque>
 #include <fstream>
 #include <algorithm>
 #include <chrono>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <memory>
 #include <cwctype>
@@ -141,6 +143,28 @@ static MediaType DetectType(const std::wstring& path)
 struct MediaItem { std::wstring path; MediaType type; };
 
 // ---------------------------------------------------------------------------
+//  Decoded-frame queue constants and element type
+//
+//  The decode thread fills a fixed-size ring-buffer queue so that at least
+//  kMinQueuedFrames frames are always ready for immediate GPU upload.
+//  kMaxQueuedFrames caps memory use; at 4 bytes/pixel a 1080p frame is ~8 MB,
+//  so 8 frames ≈ 64 MB worst-case – a reasonable upper bound.
+// ---------------------------------------------------------------------------
+static constexpr int kMinQueuedFrames = 3;
+static constexpr int kMaxQueuedFrames = 8;
+
+// One decoded video frame: BGRA pixel data plus metadata for render-side timing.
+struct DecodedFrame
+{
+    std::vector<BYTE> pixels;
+    UINT32            width     = 0;
+    UINT32            height    = 0;
+    // MF sample timestamp in 100-nanosecond units; used by the render thread
+    // to pace presentation relative to the anchor set on the first dequeue.
+    LONGLONG          timestamp = 0;
+};
+
+// ---------------------------------------------------------------------------
 //  VideoState – background thread that decodes frames via Media Foundation
 // ---------------------------------------------------------------------------
 struct VideoState
@@ -148,25 +172,39 @@ struct VideoState
     // Set before calling Start():
     std::wstring filename;
 
-    // Written by decode thread, read by render thread:
-    std::mutex           frameMutex;
-    std::vector<BYTE>    framePixels;
-    UINT32               frameW  = 0;
-    UINT32               frameH  = 0;
-    std::atomic<bool>    newFrame{ false };
-    std::atomic<int>     rotationDeg{ 0 };  // 0, 90, 180, or 270
+    // Decoded-frame queue: decoder pushes, render thread pops.
+    // Protected by queueMutex; queueSpace is signalled whenever a frame is
+    // consumed (or stop is requested) so the blocked decoder can continue.
+    std::mutex               queueMutex;
+    std::condition_variable  queueSpace;
+    std::deque<DecodedFrame> frameQueue;
+
+    // UV rotation read by the render thread to set the UV constant buffer.
+    std::atomic<int>         rotationDeg{ 0 };  // 0, 90, 180, or 270
+
+    // Set by the decode thread on a loop/seek; cleared by the render thread.
+    // The render thread resets its presentation-timing anchor when it sees this.
+    std::atomic<bool>        looped{ false };
 
     // Control flags:
-    std::atomic<bool>    paused       { false };
-    std::atomic<bool>    stopRequested{ false };
+    std::atomic<bool>        paused       { false };
+    std::atomic<bool>        stopRequested{ false };
 
-    // Metrics: running count of frames decoded (incremented in ThreadProc).
-    std::atomic<uint32_t> decodeFrameCount{ 0 };
+    // Metrics: running count of frames successfully decoded and enqueued.
+    std::atomic<uint32_t>    decodeFrameCount{ 0 };
 
-    std::thread thread;
+    std::thread              thread;
 
     void Start();
     void Stop();
+
+    // Called by the render thread: dequeues the front frame.
+    // Returns true and fills |out| when a frame is available; false if empty.
+    bool TryDequeueFrame(DecodedFrame& out);
+
+    // Returns the MF timestamp of the front queued frame, or -1 if empty.
+    // Used by the render thread to check presentation timing without dequeuing.
+    LONGLONG PeekFrontTimestamp();
 
 private:
     void ThreadProc();
@@ -176,15 +214,41 @@ void VideoState::Start()
 {
     stopRequested = false;
     paused        = false;
-    newFrame      = false;
+    looped        = false;
+    // Clear any frames left over from a previous use of this VideoState.
+    { std::lock_guard<std::mutex> lk(queueMutex); frameQueue.clear(); }
     thread        = std::thread(&VideoState::ThreadProc, this);
 }
 
 void VideoState::Stop()
 {
     stopRequested = true;
+    // Wake the decoder in case it is blocked waiting for queue space.
+    queueSpace.notify_all();
     if (thread.joinable())
         thread.join();
+    // Decoder thread has fully exited; clear any remaining queued frames.
+    // The lock is taken for consistency with all other queue accesses.
+    std::lock_guard<std::mutex> lk(queueMutex);
+    frameQueue.clear();
+}
+
+bool VideoState::TryDequeueFrame(DecodedFrame& out)
+{
+    std::lock_guard<std::mutex> lk(queueMutex);
+    if (frameQueue.empty()) return false;
+    out = std::move(frameQueue.front());
+    frameQueue.pop_front();
+    // Notify the decoder that a slot opened up.
+    queueSpace.notify_one();
+    return true;
+}
+
+LONGLONG VideoState::PeekFrontTimestamp()
+{
+    std::lock_guard<std::mutex> lk(queueMutex);
+    if (frameQueue.empty()) return -1LL;
+    return frameQueue.front().timestamp;
 }
 
 void VideoState::ThreadProc()
@@ -229,19 +293,24 @@ void VideoState::ThreadProc()
             rotationDeg = 0;  // treat 0 and any unexpected value as no rotation
     }
 
-    // Timestamp-based scheduling: MF sample timestamps are in 100-nanosecond units.
-    // We record the wall-clock time and media timestamp of the first decoded frame,
-    // then sleep_until the correct wall-clock time for each subsequent frame.
-    // This eliminates jitter from fixed Sleep() intervals and automatically handles
-    // variable frame rates (VFR) and variable decode times.
-    using Clock = std::chrono::steady_clock;
-    bool             baseSet  = false;
-    LONGLONG         baseTs   = 0;         // media timestamp of first frame (100-ns units)
-    Clock::time_point baseTime = {};       // wall-clock time when first frame was decoded
-
+    // Decode loop: fill the frame queue up to kMaxQueuedFrames frames ahead of
+    // the render thread.  Presentation timing (scheduling when each frame is
+    // actually shown) is handled by the render thread in Application::Update(),
+    // which allows the queue to stay populated (≥ kMinQueuedFrames) at all times.
     while (!stopRequested)
     {
         if (paused) { Sleep(16); continue; }
+
+        // Throttle: if the queue is already at capacity, wait until the render
+        // thread consumes a frame (or stop is requested) before decoding more.
+        {
+            std::unique_lock<std::mutex> lk(queueMutex);
+            queueSpace.wait(lk, [this] {
+                return static_cast<int>(frameQueue.size()) < kMaxQueuedFrames
+                    || stopRequested;
+            });
+        }
+        if (stopRequested) break;
 
         DWORD  streamIndex = 0, streamFlags = 0;
         LONGLONG timestamp = 0;
@@ -255,15 +324,23 @@ void VideoState::ThreadProc()
         {
             if (streamFlags & MF_SOURCE_READERF_ENDOFSTREAM)
             {
-                // Loop: seek back to the beginning and reset the scheduling base
-                // so timing restarts cleanly from the first frame of the new loop.
+                // Loop: seek back to the beginning.  Clear the queue so the
+                // render thread's timing anchor is reset on the next dequeue,
+                // then signal via the looped flag.
                 PROPVARIANT varStart;
                 PropVariantInit(&varStart);
                 varStart.vt            = VT_I8;
                 varStart.hVal.QuadPart = 0;
                 reader->SetCurrentPosition(GUID_NULL, varStart);
                 PropVariantClear(&varStart);
-                baseSet = false;
+
+                {
+                    std::lock_guard<std::mutex> lk(queueMutex);
+                    frameQueue.clear();
+                }
+                // Signal the render thread to reset its timing anchor on the
+                // next dequeue by setting the looped flag.
+                looped = true;
             }
             Sleep(1);
             continue;
@@ -278,39 +355,24 @@ void VideoState::ThreadProc()
         hr = buf->Lock(&pData, nullptr, &cbData);
         if (SUCCEEDED(hr))
         {
-            std::lock_guard<std::mutex> lk(frameMutex);
-            frameW = videoW;
-            frameH = videoH;
-            framePixels.assign(pData, pData + cbData);
-            newFrame = true;
-            // Count every successfully decoded frame for VideoDecodeFPS metric.
-            decodeFrameCount.fetch_add(1, std::memory_order_relaxed);
+            DecodedFrame f;
+            f.width     = videoW;
+            f.height    = videoH;
+            f.timestamp = timestamp;
+            f.pixels.assign(pData, pData + cbData);
             buf->Unlock();
-        }
 
-        // Schedule presentation time based on the MF sample timestamp.
-        // MF timestamps are in 100-nanosecond units (Windows REFERENCE_TIME).
-        if (!baseSet)
-        {
-            // Anchor wall-clock time and media time at the first decoded frame.
-            baseTs   = timestamp;
-            baseTime = Clock::now();
-            baseSet  = true;
-        }
-        else
-        {
-            // Compute the wall-clock instant when this frame is due.
-            // Use a 100-ns tick duration directly (ratio<1,10000000>) to match
-            // MF timestamp units without an explicit multiply that could mislead.
-            using HundredNs = std::chrono::duration<LONGLONG, std::ratio<1, 10'000'000>>;
-            auto due = baseTime + std::chrono::duration_cast<Clock::duration>(
-                HundredNs(timestamp - baseTs));
-
-            // Only sleep if the frame's presentation time is still in the future;
-            // if we have already passed the due time, skip sleeping so we catch
-            // up instead of accumulating latency.
-            if (Clock::now() < due)
-                std::this_thread::sleep_until(due);
+            // Enqueue the decoded frame.  The wait at the top of the loop already
+            // ensured there is space, but check again in case stop was requested.
+            {
+                std::lock_guard<std::mutex> lk(queueMutex);
+                if (!stopRequested)
+                {
+                    frameQueue.push_back(std::move(f));
+                    // Count every successfully enqueued frame for VideoDecodeFPS.
+                    decodeFrameCount.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
         }
     }
 
@@ -363,6 +425,12 @@ private:
         UINT                             texH       = 0;
         bool                             hasContent = false;
         std::unique_ptr<VideoState>      video;
+
+        // Render-side presentation-timing anchor for this plane's video.
+        // Set on the first frame dequeued; reset when the video loops or changes.
+        bool                             videoTimingSet = false;
+        LONGLONG                         videoBaseTs    = 0;   // MF 100-ns units
+        std::chrono::steady_clock::time_point videoBaseTime;
     };
     Plane m_plane[2];
 
@@ -714,6 +782,7 @@ bool Application::LoadMedia(int planeIdx, int mediaIdx)
 
     auto& p = m_plane[planeIdx];
     if (p.video) { p.video->Stop(); p.video.reset(); }
+    p.videoTimingSet = false;   // reset presentation-timing anchor for new media
     p.hasContent = false;
 
     if (item.type == MediaType::Image)
@@ -834,17 +903,48 @@ void Application::Update()
     }
 
     // --- Pull new video frames into textures ---------------------------------
+    // The decoder fills a queue of up to kMaxQueuedFrames decoded frames so at
+    // least kMinQueuedFrames are always immediately available.  Here we dequeue
+    // one frame per plane per Update() call, but only when its media timestamp
+    // says it is due for presentation.  This moves timing from the decode thread
+    // to the render thread, keeping the queue populated and decoding smooth.
     for (int i = 0; i < 2; ++i)
     {
         auto& p = m_plane[i];
-        if (!p.video || !p.video->newFrame.load()) continue;
+        if (!p.video) continue;
 
-        std::lock_guard<std::mutex> lk(p.video->frameMutex);
-        if (p.video->newFrame && p.video->frameW > 0 && p.video->frameH > 0)
+        // If the decoder looped, reset our timing anchor so the new loop's
+        // first frame sets a fresh baseline.
+        if (p.video->looped.exchange(false))
+            p.videoTimingSet = false;
+
+        LONGLONG frontTs = p.video->PeekFrontTimestamp();
+        if (frontTs < 0) continue;   // queue is empty
+
+        bool due = false;
+        if (!p.videoTimingSet)
         {
-            UploadPixels(i, p.video->framePixels.data(),
-                         p.video->frameW, p.video->frameH);
-            p.video->newFrame = false;
+            // First frame after start or loop: anchor wall-clock time to now.
+            p.videoBaseTs    = frontTs;
+            p.videoBaseTime  = Clock::now();
+            p.videoTimingSet = true;
+            due = true;
+        }
+        else
+        {
+            // Compute the wall-clock instant when this frame is due.
+            // MF timestamps are in 100-nanosecond units (REFERENCE_TIME).
+            using HundredNs = std::chrono::duration<LONGLONG, std::ratio<1, 10'000'000>>;
+            auto dueTime = p.videoBaseTime + std::chrono::duration_cast<Clock::duration>(
+                HundredNs(frontTs - p.videoBaseTs));
+            due = (Clock::now() >= dueTime);
+        }
+
+        if (due)
+        {
+            DecodedFrame f;
+            if (p.video->TryDequeueFrame(f) && f.width > 0 && f.height > 0)
+                UploadPixels(i, f.pixels.data(), f.width, f.height);
         }
     }
 
