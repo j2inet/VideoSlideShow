@@ -72,13 +72,18 @@ cbuffer TransformCB : register(b0)
 {
     row_major float4x4 g_Transform;
 };
+cbuffer UVTransformCB : register(b1)
+{
+    row_major float4x4 g_UVTransform;
+};
 struct VS_IN  { float2 pos : POSITION; float2 uv : TEXCOORD0; };
 struct VS_OUT { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
 VS_OUT main(VS_IN v)
 {
     VS_OUT o;
     o.pos = mul(float4(v.pos, 0.0f, 1.0f), g_Transform);
-    o.uv  = v.uv;
+    float4 uv4 = mul(float4(v.uv, 0.0f, 1.0f), g_UVTransform);
+    o.uv = uv4.xy;
     return o;
 }
 )hlsl";
@@ -142,6 +147,7 @@ struct VideoState
     UINT32               frameW  = 0;
     UINT32               frameH  = 0;
     std::atomic<bool>    newFrame{ false };
+    std::atomic<int>     rotationDeg{ 0 };  // 0, 90, 180, or 270
 
     // Control flags:
     std::atomic<bool>    paused       { false };
@@ -202,6 +208,16 @@ void VideoState::ThreadProc()
     reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &curType);
     UINT32 videoW = 0, videoH = 0;
     MFGetAttributeSize(curType.Get(), MF_MT_FRAME_SIZE, &videoW, &videoH);
+
+    // Read rotation metadata; default to 0 if not present.
+    {
+        UINT32 rot = 0;
+        curType->GetUINT32(MF_MT_VIDEO_ROTATION, &rot);
+        if (rot == 90 || rot == 180 || rot == 270)
+            rotationDeg = static_cast<int>(rot);
+        else
+            rotationDeg = 0;  // treat 0 and any unexpected value as no rotation
+    }
 
     // Retrieve frame rate to pace playback accurately.
     UINT32 rateNum = 30, rateDen = 1;
@@ -290,7 +306,8 @@ private:
     ComPtr<ID3D11InputLayout>       m_il;
     ComPtr<ID3D11Buffer>            m_vb;
     ComPtr<ID3D11Buffer>            m_ib;
-    ComPtr<ID3D11Buffer>            m_cb[2];   // per-plane constant buffer
+    ComPtr<ID3D11Buffer>            m_cb[2];   // per-plane constant buffer (b0: position)
+    ComPtr<ID3D11Buffer>            m_uvcb[2]; // per-plane UV transform buffer (b1: UV rotation)
     ComPtr<ID3D11SamplerState>      m_samp;
     ComPtr<ID3D11RasterizerState>   m_rast;
     ComPtr<ID3D11BlendState>        m_blend;
@@ -339,6 +356,7 @@ private:
     void EnsureTexture(int planeIdx, UINT w, UINT h);
     void UploadPixels(int planeIdx, const BYTE* pixels, UINT w, UINT h);
     void UpdateCB(int planeIdx);
+    void UpdateUVCB(int planeIdx);
 
     static float EaseInOut(float t) { return t * t * (3.0f - 2.0f * t); }
 };
@@ -399,6 +417,8 @@ bool Application::Initialize(HWND hwnd, int w, int h)
 
     UpdateCB(0);
     UpdateCB(1);
+    UpdateUVCB(0);
+    UpdateUVCB(1);
     return true;
 }
 
@@ -509,6 +529,9 @@ bool Application::CreateConstantBuffers()
 
     for (int i = 0; i < 2; ++i)
         if (FAILED(m_dev->CreateBuffer(&cbd, nullptr, &m_cb[i]))) return false;
+
+    for (int i = 0; i < 2; ++i)
+        if (FAILED(m_dev->CreateBuffer(&cbd, nullptr, &m_uvcb[i]))) return false;
     return true;
 }
 
@@ -665,6 +688,36 @@ void Application::UpdateCB(int idx)
 }
 
 // ---------------------------------------------------------------------------
+void Application::UpdateUVCB(int idx)
+{
+    int rot = 0;
+    if (m_plane[idx].video)
+        rot = m_plane[idx].video->rotationDeg.load();
+
+    XMMATRIX m = XMMatrixIdentity();
+    if (rot == 90 || rot == 180 || rot == 270)
+    {
+        // Rotate around UV center (0.5, 0.5).
+        // Negate angle: UV Y-axis points down, so a positive rotation in
+        // degrees maps to a negative Z-rotation in the XMMatrix convention.
+        const XMMATRIX T0 = XMMatrixTranslation(-0.5f, -0.5f, 0.0f);
+        const XMMATRIX T1 = XMMatrixTranslation( 0.5f,  0.5f, 0.0f);
+        float angle = static_cast<float>(rot) * (XM_PI / 180.0f);
+        m = T0 * XMMatrixRotationZ(-angle) * T1;
+    }
+
+    XMFLOAT4X4 mat;
+    XMStoreFloat4x4(&mat, m);
+
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (SUCCEEDED(m_ctx->Map(m_uvcb[idx].Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms)))
+    {
+        memcpy(ms.pData, &mat, sizeof(mat));
+        m_ctx->Unmap(m_uvcb[idx].Get(), 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
 void Application::OnClick()
 {
     if (m_transitioning) return;
@@ -744,6 +797,10 @@ void Application::Update()
             p.video->newFrame = false;
         }
     }
+
+    // --- Update UV rotation transforms ---------------------------------------
+    UpdateUVCB(0);
+    UpdateUVCB(1);
 }
 
 // ---------------------------------------------------------------------------
@@ -784,7 +841,8 @@ void Application::Render()
         auto& p = m_plane[i];
         if (!p.hasContent || !p.srv) continue;
 
-        m_ctx->VSSetConstantBuffers(0, 1, m_cb[i].GetAddressOf());
+        ID3D11Buffer* cbs[2] = { m_cb[i].Get(), m_uvcb[i].Get() };
+        m_ctx->VSSetConstantBuffers(0, 2, cbs);
         m_ctx->PSSetShaderResources(0, 1, p.srv.GetAddressOf());
         m_ctx->DrawIndexed(6, 0, 0);
     }
