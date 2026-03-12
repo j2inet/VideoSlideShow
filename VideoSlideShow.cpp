@@ -226,14 +226,15 @@ void VideoState::ThreadProc()
             rotationDeg = 0;  // treat 0 and any unexpected value as no rotation
     }
 
-    // Retrieve frame rate to pace playback accurately.
-    UINT32 rateNum = 30, rateDen = 1;
-    MFGetAttributeRatio(curType.Get(), MF_MT_FRAME_RATE, &rateNum, &rateDen);
-    if (rateNum == 0) rateNum = 30;
-    DWORD frameSleepMs = static_cast<DWORD>(
-        (static_cast<double>(rateDen) / rateNum) * 1000.0 + 0.5);
-    if (frameSleepMs < 1)  frameSleepMs = 1;
-    if (frameSleepMs > 100) frameSleepMs = 100;
+    // Timestamp-based scheduling: MF sample timestamps are in 100-nanosecond units.
+    // We record the wall-clock time and media timestamp of the first decoded frame,
+    // then sleep_until the correct wall-clock time for each subsequent frame.
+    // This eliminates jitter from fixed Sleep() intervals and automatically handles
+    // variable frame rates (VFR) and variable decode times.
+    using Clock = std::chrono::steady_clock;
+    bool             baseSet  = false;
+    LONGLONG         baseTs   = 0;         // media timestamp of first frame (100-ns units)
+    Clock::time_point baseTime = {};       // wall-clock time when first frame was decoded
 
     while (!stopRequested)
     {
@@ -251,13 +252,15 @@ void VideoState::ThreadProc()
         {
             if (streamFlags & MF_SOURCE_READERF_ENDOFSTREAM)
             {
-                // Loop: seek back to the beginning.
+                // Loop: seek back to the beginning and reset the scheduling base
+                // so timing restarts cleanly from the first frame of the new loop.
                 PROPVARIANT varStart;
                 PropVariantInit(&varStart);
-                varStart.vt           = VT_I8;
+                varStart.vt            = VT_I8;
                 varStart.hVal.QuadPart = 0;
                 reader->SetCurrentPosition(GUID_NULL, varStart);
                 PropVariantClear(&varStart);
+                baseSet = false;
             }
             Sleep(1);
             continue;
@@ -267,8 +270,8 @@ void VideoState::ThreadProc()
         ComPtr<IMFMediaBuffer> buf;
         sample->ConvertToContiguousBuffer(&buf);
 
-        BYTE* pData   = nullptr;
-        DWORD cbData  = 0;
+        BYTE* pData  = nullptr;
+        DWORD cbData = 0;
         hr = buf->Lock(&pData, nullptr, &cbData);
         if (SUCCEEDED(hr))
         {
@@ -280,7 +283,30 @@ void VideoState::ThreadProc()
             buf->Unlock();
         }
 
-        Sleep(frameSleepMs);
+        // Schedule presentation time based on the MF sample timestamp.
+        // MF timestamps are in 100-nanosecond units (Windows REFERENCE_TIME).
+        if (!baseSet)
+        {
+            // Anchor wall-clock time and media time at the first decoded frame.
+            baseTs   = timestamp;
+            baseTime = Clock::now();
+            baseSet  = true;
+        }
+        else
+        {
+            // Compute the wall-clock instant when this frame is due.
+            // Use a 100-ns tick duration directly (ratio<1,10000000>) to match
+            // MF timestamp units without an explicit multiply that could mislead.
+            using HundredNs = std::chrono::duration<LONGLONG, std::ratio<1, 10'000'000>>;
+            auto due = baseTime + std::chrono::duration_cast<Clock::duration>(
+                HundredNs(timestamp - baseTs));
+
+            // Only sleep if the frame's presentation time is still in the future;
+            // if we have already passed the due time, skip sleeping so we catch
+            // up instead of accumulating latency.
+            if (Clock::now() < due)
+                std::this_thread::sleep_until(due);
+        }
     }
 
     reader.Reset();
